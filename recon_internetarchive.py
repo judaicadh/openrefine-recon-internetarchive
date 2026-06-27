@@ -106,6 +106,22 @@ def lucene_sanitize(s: str) -> str:
     return re.sub(r'[+\-!(){}\[\]^"~*?:\\/]', " ", s).strip()
 
 
+def fuzzy_lucene(s: str) -> str:
+    """Turn each word into a Lucene fuzzy term (word~) for typo tolerance."""
+    words = lucene_sanitize(s).split()
+    return " ".join(f"{w}~" for w in words if len(w) > 2)
+
+
+def search_variants(title: str) -> str:
+    """Build a Lucene OR query with the original title and its normalized form."""
+    orig = lucene_sanitize(title)
+    norm = lucene_sanitize(normalize(title))
+    parts = [orig]
+    if norm and norm != orig.lower():
+        parts.append(norm)
+    return " OR ".join(f"({p})" for p in parts)
+
+
 FILTER_PROPS = ["creator", "year", "collection", "language", "mediatype"]
 FILTER_PROP_META = [
     {"id": "creator", "name": "Creator / artist"},
@@ -132,14 +148,23 @@ def as_list(v) -> list[str]:
     return [str(x) for x in v] if isinstance(v, list) else [str(v)]
 
 
+def best_fuzzy(a: str, b: str) -> float:
+    """Return the best score across multiple rapidfuzz algorithms."""
+    return max(
+        fuzz.token_set_ratio(a, b),
+        fuzz.token_sort_ratio(a, b),
+        fuzz.partial_ratio(a, b),
+    )
+
+
 def score_candidate(query_title: str, query_creator: str, doc: dict) -> float:
-    title_score = fuzz.token_set_ratio(
-        normalize(query_title), normalize(str(doc.get("title", ""))))
+    nq = normalize(query_title)
+    nd = normalize(str(doc.get("title", "")))
+    title_score = best_fuzzy(nq, nd)
     if not query_creator:
         return title_score
     creators = " ".join(as_list(doc.get("creator")))
-    creator_score = fuzz.token_set_ratio(
-        normalize(query_creator), normalize(creators))
+    creator_score = best_fuzzy(normalize(query_creator), normalize(creators))
     return 0.65 * title_score + 0.35 * creator_score
 
 
@@ -157,11 +182,13 @@ def reconcile_one(q: dict) -> dict:
     bound = {pid: prop_value(q.get("properties"), pid) for pid in FILTER_PROPS}
     mediatype = bound["mediatype"] or qtype
 
-    parts = [f'title:({lucene_sanitize(query_title)})']
+    title_variants = search_variants(query_title)
+    parts = [f'title:({title_variants})']
     if mediatype:
         parts.append(f"mediatype:({lucene_sanitize(mediatype)})")
     if bound["creator"]:
-        parts.append(f'creator:({lucene_sanitize(bound["creator"])})')
+        creator_variants = search_variants(bound["creator"])
+        parts.append(f'creator:({creator_variants})')
     if bound["year"]:
         parts.append(f'year:({lucene_sanitize(bound["year"])})')
     if bound["collection"]:
@@ -169,11 +196,12 @@ def reconcile_one(q: dict) -> dict:
     if bound["language"]:
         parts.append(f'language:({lucene_sanitize(bound["language"])})')
 
+    fl = ["identifier", "title", "creator", "year", "date",
+          "collection", "mediatype"]
     params = {
         "q": " AND ".join(parts),
-        "fl[]": ["identifier", "title", "creator", "year", "date",
-                 "collection", "mediatype"],
-        "rows": 10,
+        "fl[]": fl,
+        "rows": 20,
         "page": 1,
         "output": "json",
     }
@@ -184,7 +212,7 @@ def reconcile_one(q: dict) -> dict:
              {k: v for k, v in bound.items() if v} or "none",
              len(docs))
 
-    # loose retry: title words + creator as free text, keep mediatype only
+    # retry 1: drop field restrictions, use free-text + creator, keep mediatype
     if not docs and any(bound.values()):
         loose_q = lucene_sanitize(f"{bound['creator']} {query_title}")
         params["q"] = f"({loose_q})" + (
@@ -192,6 +220,16 @@ def reconcile_one(q: dict) -> dict:
         data = ia_get(SEARCH_URL, params)
         docs = ((data or {}).get("response") or {}).get("docs", [])
         log.info("  loose retry -> %d hits", len(docs))
+
+    # retry 2: Lucene fuzzy (~) on each word for typo tolerance
+    if not docs:
+        fuzzy_q = fuzzy_lucene(query_title)
+        if fuzzy_q:
+            params["q"] = f"title:({fuzzy_q})" + (
+                f" AND mediatype:({lucene_sanitize(mediatype)})" if mediatype else "")
+            data = ia_get(SEARCH_URL, params)
+            docs = ((data or {}).get("response") or {}).get("docs", [])
+            log.info("  fuzzy retry -> %d hits", len(docs))
 
     results = []
     for doc in docs:
@@ -319,6 +357,18 @@ MANIFEST = {
         "height": 130,
     },
     "suggest": {
+        "entity": {
+            "service_url": f"http://localhost:{PORT}",
+            "service_path": "/reconcile/suggest/entity",
+            "flyout_service_url": f"http://localhost:{PORT}",
+            "flyout_service_path": "/reconcile/flyout/entity?id=${id}",
+        },
+        "type": {
+            "service_url": f"http://localhost:{PORT}",
+            "service_path": "/reconcile/suggest/type",
+            "flyout_service_url": f"http://localhost:{PORT}",
+            "flyout_service_path": "/reconcile/flyout/type?id=${id}",
+        },
         "property": {
             "service_url": f"http://localhost:{PORT}",
             "service_path": "/reconcile/suggest/property",
@@ -372,6 +422,89 @@ def reconcile():
         })
 
     return jsonp_or_json(MANIFEST)
+
+
+@app.route("/reconcile/suggest/entity")
+def suggest_entity():
+    prefix = (request.args.get("prefix") or "").strip()
+    if not prefix:
+        return jsonp_or_json({"code": "/api/status/ok", "status": "200 OK",
+                              "prefix": prefix, "result": []})
+    title_variants = search_variants(prefix)
+    params = {
+        "q": f"title:({title_variants}) OR ({lucene_sanitize(prefix)})",
+        "fl[]": ["identifier", "title", "creator", "mediatype"],
+        "rows": 20,
+        "page": 1,
+        "output": "json",
+    }
+    data = ia_get(SEARCH_URL, params)
+    docs = ((data or {}).get("response") or {}).get("docs", [])
+    if not docs:
+        fuzzy_q = fuzzy_lucene(prefix)
+        if fuzzy_q:
+            params["q"] = f"title:({fuzzy_q})"
+            data = ia_get(SEARCH_URL, params)
+            docs = ((data or {}).get("response") or {}).get("docs", [])
+    scored = []
+    for doc in docs:
+        ident = doc.get("identifier")
+        if not ident:
+            continue
+        score = best_fuzzy(normalize(prefix),
+                           normalize(str(doc.get("title", ""))))
+        creators = ", ".join(as_list(doc.get("creator")))[:60]
+        name = str(doc.get("title", ""))
+        desc = creators or str(doc.get("mediatype", ""))
+        scored.append((score, {
+            "id": ident,
+            "name": name,
+            "description": desc,
+            "notable": [{"id": str(doc.get("mediatype", "audio")),
+                         "name": str(doc.get("mediatype", "audio")).capitalize()}],
+        }))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    results = [r for _, r in scored[:10]]
+    return jsonp_or_json({"code": "/api/status/ok", "status": "200 OK",
+                          "prefix": prefix, "result": results})
+
+
+TYPES = [
+    {"id": "audio", "name": "Audio"},
+    {"id": "texts", "name": "Texts"},
+    {"id": "movies", "name": "Movies"},
+    {"id": "image", "name": "Image"},
+]
+
+
+@app.route("/reconcile/suggest/type")
+def suggest_type():
+    prefix = (request.args.get("prefix") or "").lower()
+    matches = [t for t in TYPES
+               if prefix in t["id"] or prefix in t["name"].lower()]
+    return jsonp_or_json({"code": "/api/status/ok", "status": "200 OK",
+                          "prefix": prefix, "result": matches or TYPES})
+
+
+@app.route("/reconcile/flyout/entity")
+def flyout_entity():
+    identifier = request.args.get("id", "")
+    data = get_metadata_cached(identifier)
+    if data is None:
+        return jsonp_or_json({"id": identifier, "html": "<p>Not found</p>"})
+    md = data.get("metadata") or {}
+    creators = ", ".join(as_list(md.get("creator")))
+    html = (f"<p><b>{md.get('title', '')}</b><br/>"
+            f"{creators}<br/>"
+            f"{md.get('date') or md.get('year') or ''}</p>")
+    return jsonp_or_json({"id": identifier, "html": html})
+
+
+@app.route("/reconcile/flyout/type")
+def flyout_type():
+    type_id = request.args.get("id", "")
+    html = f"<p><b>{type_id.capitalize()}</b> — Internet Archive mediatype</p>"
+    return jsonp_or_json({"id": type_id, "html": html})
 
 
 @app.route("/reconcile/suggest/property")

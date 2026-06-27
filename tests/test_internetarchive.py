@@ -62,7 +62,7 @@ def test_bound_properties_become_query_filters(client):
                "properties": [{"pid": "creator", "v": "Barry Sisters"},
                               {"pid": "collection", "v": "georgeblood"}]}}
     r = client.post("/reconcile", data={"queries": json.dumps(queries)})
-    assert "creator:(Barry Sisters)" in fake_get.last_q
+    assert "creator:" in fake_get.last_q and "Barry Sisters" in fake_get.last_q
     assert "collection:(georgeblood)" in fake_get.last_q
     assert "mediatype:(audio)" in fake_get.last_q
     results = r.get_json()["q0"]["result"]
