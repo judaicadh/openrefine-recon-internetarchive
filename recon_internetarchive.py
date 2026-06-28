@@ -101,6 +101,39 @@ def normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+STOP_WORDS = frozenset(
+    "a an and are as at be but by for from had has have he her his how i if"
+    " in into is it its may my no nor not of on or our out own per she so"
+    " than that the their them then there these they this those to too unto"
+    " up upon us was we were what when which who whom why will with you your"
+    " also been being between both do does done each even few got has into"
+    " just like many more most much must need new now off often old one only"
+    " other over own part per said same see should since some still such take"
+    " tell th through under used very want well where while would yet"
+    " illustrated account ancient modern".split()
+)
+
+MAX_SEARCH_TERMS = 12
+
+
+def remove_stop_words(s: str) -> str:
+    words = s.split()
+    kept = [w for w in words if w.lower() not in STOP_WORDS]
+    return " ".join(kept) if kept else " ".join(words[:MAX_SEARCH_TERMS])
+
+
+def extract_key_terms(s: str) -> str:
+    """Pull the most distinctive words from a long title for searching."""
+    sanitized = lucene_sanitize(s)
+    sanitized = re.sub(r"[,;.]", " ", sanitized)
+    sanitized = re.sub(r"\s+", " ", sanitized).strip()
+    without_stops = remove_stop_words(sanitized)
+    words = without_stops.split()
+    if len(words) > MAX_SEARCH_TERMS:
+        words = words[:MAX_SEARCH_TERMS]
+    return " ".join(words)
+
+
 def lucene_sanitize(s: str) -> str:
     """Strip characters with meaning in IA's Lucene-ish query syntax."""
     return re.sub(r'[+\-!(){}\[\]^"~*?:\\/]', " ", s).strip()
@@ -108,14 +141,14 @@ def lucene_sanitize(s: str) -> str:
 
 def fuzzy_lucene(s: str) -> str:
     """Turn each word into a Lucene fuzzy term (word~) for typo tolerance."""
-    words = lucene_sanitize(s).split()
+    words = extract_key_terms(s).split()
     return " ".join(f"{w}~" for w in words if len(w) > 2)
 
 
 def search_variants(title: str) -> str:
-    """Build a Lucene OR query with the original title and its normalized form."""
-    orig = lucene_sanitize(title)
-    norm = lucene_sanitize(normalize(title))
+    """Build a Lucene OR query with key terms from the title + normalized form."""
+    orig = extract_key_terms(title)
+    norm = extract_key_terms(normalize(title))
     parts = [orig]
     if norm and norm != orig.lower():
         parts.append(norm)
@@ -432,7 +465,7 @@ def suggest_entity():
                               "prefix": prefix, "result": []})
     title_variants = search_variants(prefix)
     params = {
-        "q": f"title:({title_variants}) OR ({lucene_sanitize(prefix)})",
+        "q": f"title:({title_variants}) OR ({extract_key_terms(prefix)})",
         "fl[]": ["identifier", "title", "creator", "mediatype"],
         "rows": 20,
         "page": 1,
